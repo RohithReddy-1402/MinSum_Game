@@ -39,44 +39,37 @@ function handSum(cards) {
 function validateThrow(cards) {
   if (!cards || cards.length === 0) return { valid: false, reason: "No cards selected" };
 
+  // ✅ Single card — always valid
+  if (cards.length === 1) return { valid: true, type: "single" };
+
   const nonJoker = cards.filter(c => !c.isJoker);
   const jokers = cards.filter(c => c.isJoker);
 
-  // All jokers — need >= 2
-  if (nonJoker.length === 0) {
-    if (cards.length >= 2) return { valid: true, type: "set" };
-    return { valid: false, reason: "Cannot throw a single joker alone" };
-  }
+  // All jokers (2+) — valid
+  if (nonJoker.length === 0) return { valid: true, type: "set" };
 
-  // Same-number set (≥ 2 cards, all same rank)
+  // Same-rank set (≥ 2)
   if (cards.length >= 2) {
     const ranks = nonJoker.map(c => c.rank);
     if (ranks.every(r => r === ranks[0])) return { valid: true, type: "set" };
   }
 
-  // Sequence (≥ 3 consecutive, jokers fill gaps)
+  // Consecutive sequence (≥ 3), jokers fill gaps
   if (cards.length >= 3) {
     const orders = nonJoker.map(c => RANK_ORDER[c.rank]).sort((a, b) => a - b);
     const min = orders[0];
     const max = orders[orders.length - 1];
     const span = max - min + 1;
-
-    // Count gaps
     let gaps = 0;
     for (let i = 0; i < orders.length - 1; i++) gaps += orders[i + 1] - orders[i] - 1;
-
-    // All slots filled by non-jokers
-    if (span === cards.length && gaps === 0) return { valid: true, type: "sequence" };
-
-    // Gaps filled exactly by jokers
-    if (gaps === jokers.length && span === cards.length) return { valid: true, type: "sequence" };
+    if (span === cards.length && (gaps === 0 || gaps === jokers.length)) return { valid: true, type: "sequence" };
   }
 
-  if (cards.length === 1) return { valid: false, reason: "Cannot throw a single card (need ≥2 same rank or ≥3 sequence)" };
-  return { valid: false, reason: "Invalid set — need ≥2 same rank OR ≥3 consecutive sequence" };
+  return { valid: false, reason: "Invalid — 2 cards must be same rank, 3+ must be consecutive sequence" };
 }
 
 // Same rank AND same count as previous throw → no pick needed
+// Now works for single cards too: throw same rank single = skip pick
 function matchesPrevious(selected, prevThrown) {
   if (!prevThrown || prevThrown.length === 0) return false;
   if (selected.length !== prevThrown.length) return false;
@@ -84,7 +77,9 @@ function matchesPrevious(selected, prevThrown) {
   const prevNonJoker = prevThrown.filter(c => !c.isJoker);
   const selNonJoker = selected.filter(c => !c.isJoker);
 
-  if (prevNonJoker.length === 0 || selNonJoker.length === 0) return false;
+  // Both all jokers
+  if (prevNonJoker.length === 0 && selNonJoker.length === 0) return true;
+  if (!prevNonJoker.length || !selNonJoker.length) return false;
 
   const prevRank = prevNonJoker[0].rank;
   const selRank = selNonJoker[0].rank;
