@@ -18,11 +18,8 @@ const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
 });
 
-// ─── In-memory store ──────────────────────────────────────────────────────────
-// rooms[roomCode] = { code, hostId, config, players, gameState, status }
 const rooms = {};
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 function genRoomCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let code = "";
@@ -30,7 +27,7 @@ function genRoomCode() {
   return code;
 }
 
-function sanitizeRoomForClient(room, requestingSocketId) {
+function sanitizeRoomForClient(room, requestingPlayerId) {
   if (!room) return null;
   return {
     code: room.code,
@@ -44,21 +41,19 @@ function sanitizeRoomForClient(room, requestingSocketId) {
       eliminated: p.eliminated,
       connected: p.connected,
       cardCount: p.hand ? p.hand.length : 0,
-      // Only send own hand
-      hand: p.id === requestingSocketId ? p.hand : undefined,
+      hand: p.id === requestingPlayerId ? p.hand : undefined,
     })),
-    gameState: room.gameState
-      ? {
-          currentIdx: room.gameState.currentIdx,
-          phase: room.gameState.phase,
-          prevThrown: room.gameState.prevThrown,
-          openingCard: room.gameState.openingCard,
-          deckCount: room.gameState.deck ? room.gameState.deck.length : 0,
-          log: room.gameState.log,
-          showResult: room.gameState.showResult,
-          roundNum: room.gameState.roundNum,
-        }
-      : null,
+    gameState: room.gameState ? {
+      currentIdx: room.gameState.currentIdx,
+      phase: room.gameState.phase,
+      prevThrown: room.gameState.prevThrown,
+      pickablePile: room.gameState.pickablePile,
+      deckCount: room.gameState.deck ? room.gameState.deck.length : 0,
+      log: room.gameState.log,
+      showResult: room.gameState.showResult,
+      roundNum: room.gameState.roundNum,
+      lastThrownBy: room.gameState.lastThrownBy,
+    } : null,
   };
 }
 
@@ -71,16 +66,12 @@ function broadcastRoom(room) {
 }
 
 function findRoomBySocket(socketId) {
-  return Object.values(rooms).find(r =>
-    r.players.some(p => p.socketId === socketId)
-  );
+  return Object.values(rooms).find(r => r.players.some(p => p.socketId === socketId));
 }
 
-// ─── Socket handlers ──────────────────────────────────────────────────────────
 io.on("connection", (socket) => {
   console.log(`[connect] ${socket.id}`);
 
-  // ── Create room ─────────────────────────────────────────────────────────────
   socket.on("room:create", ({ name, config }, cb) => {
     let code = genRoomCode();
     while (rooms[code]) code = genRoomCode();
@@ -89,23 +80,17 @@ io.on("connection", (socket) => {
     const room = {
       code,
       hostId: playerId,
-      status: "lobby",    // lobby | playing | finished
+      status: "lobby",
       config: {
         cardsEach: config?.cardsEach ?? 5,
         showPenalty: config?.showPenalty ?? 50,
         penaltyLimit: config?.penaltyLimit ?? 210,
       },
-      players: [
-        {
-          id: playerId,
-          socketId: socket.id,
-          name: name || "Host",
-          score: 0,
-          eliminated: false,
-          connected: true,
-          hand: [],
-        },
-      ],
+      players: [{
+        id: playerId, socketId: socket.id,
+        name: name || "Host", score: 0,
+        eliminated: false, connected: true, hand: [],
+      }],
       gameState: null,
     };
 
@@ -116,7 +101,6 @@ io.on("connection", (socket) => {
     broadcastRoom(room);
   });
 
-  // ── Join room ───────────────────────────────────────────────────────────────
   socket.on("room:join", ({ code, name }, cb) => {
     const room = rooms[code?.toUpperCase()];
     if (!room) return cb({ ok: false, error: "Room not found" });
@@ -125,13 +109,9 @@ io.on("connection", (socket) => {
 
     const playerId = uuidv4();
     room.players.push({
-      id: playerId,
-      socketId: socket.id,
+      id: playerId, socketId: socket.id,
       name: name || `Player ${room.players.length + 1}`,
-      score: 0,
-      eliminated: false,
-      connected: true,
-      hand: [],
+      score: 0, eliminated: false, connected: true, hand: [],
     });
 
     socket.join(code.toUpperCase());
@@ -140,12 +120,11 @@ io.on("connection", (socket) => {
     broadcastRoom(room);
   });
 
-  // ── Rejoin (on reconnect) ───────────────────────────────────────────────────
   socket.on("room:rejoin", ({ code, playerId }, cb) => {
     const room = rooms[code];
     if (!room) return cb({ ok: false, error: "Room not found" });
     const player = room.players.find(p => p.id === playerId);
-    if (!player) return cb({ ok: false, error: "Player not found in room" });
+    if (!player) return cb({ ok: false, error: "Player not found" });
 
     player.socketId = socket.id;
     player.connected = true;
@@ -155,7 +134,6 @@ io.on("connection", (socket) => {
     broadcastRoom(room);
   });
 
-  // ── Update config (host only) ───────────────────────────────────────────────
   socket.on("room:config", ({ code, playerId, config }) => {
     const room = rooms[code];
     if (!room || room.hostId !== playerId) return;
@@ -163,7 +141,6 @@ io.on("connection", (socket) => {
     broadcastRoom(room);
   });
 
-  // ── Start game (host only) ──────────────────────────────────────────────────
   socket.on("game:start", ({ code, playerId }, cb) => {
     const room = rooms[code];
     if (!room) return cb?.({ ok: false, error: "Room not found" });
@@ -174,15 +151,22 @@ io.on("connection", (socket) => {
     const { players, openingCard, deck } = dealRound(room.players, room.config.cardsEach);
     room.players = players;
     room.status = "playing";
+
+    // Opening card placed on the table as the starting pile.
+    // First player starts in "throw" phase — throw first, then pick if needed.
     room.gameState = {
       currentIdx: 0,
-      phase: "pick",       // pick | throw
-      prevThrown: [],
-      openingCard,
+      phase: "throw",
+      prevThrown: [openingCard],  // Opening card is on the pile — anyone can pick it after throwing
+      pickablePile: null,         // Set during pick phase = prev player's thrown cards
       deck,
-      log: [`Game started! ${room.players[0].name} goes first.`],
+      log: [
+        `Game started! Opening card: ${openingCard.rank}${openingCard.suit} is on the table.`,
+        `${room.players[0].name} goes first — select cards and throw!`,
+      ],
       showResult: null,
       roundNum: 1,
+      lastThrownBy: null,
     };
 
     console.log(`[game:start] ${code}`);
@@ -190,52 +174,10 @@ io.on("connection", (socket) => {
     broadcastRoom(room);
   });
 
-  // ── Pick from pile ──────────────────────────────────────────────────────────
-  socket.on("game:pick_pile", ({ code, playerId, cardId }, cb) => {
-    const room = rooms[code];
-    if (!room || !room.gameState) return cb?.({ ok: false, error: "No active game" });
-
-    const gs = room.gameState;
-    const playerIdx = room.players.findIndex(p => p.id === playerId);
-    if (playerIdx !== gs.currentIdx) return cb?.({ ok: false, error: "Not your turn" });
-    if (gs.phase !== "pick") return cb?.({ ok: false, error: "Not in pick phase" });
-
-    const card = gs.prevThrown.find(c => c.id === cardId);
-    if (!card) return cb?.({ ok: false, error: "Card not found in pile" });
-
-    const player = room.players[playerIdx];
-    player.hand = [...player.hand, card];
-    gs.prevThrown = gs.prevThrown.filter(c => c.id !== cardId);
-    gs.phase = "throw";
-    gs.log.push(`${player.name} picked ${card.rank}${card.suit} from pile`);
-
-    cb?.({ ok: true });
-    broadcastRoom(room);
-  });
-
-  // ── Draw from stack ─────────────────────────────────────────────────────────
-  socket.on("game:draw_stack", ({ code, playerId }, cb) => {
-    const room = rooms[code];
-    if (!room || !room.gameState) return cb?.({ ok: false, error: "No active game" });
-
-    const gs = room.gameState;
-    const playerIdx = room.players.findIndex(p => p.id === playerId);
-    if (playerIdx !== gs.currentIdx) return cb?.({ ok: false, error: "Not your turn" });
-    if (gs.phase !== "pick") return cb?.({ ok: false, error: "Not in pick phase" });
-    if (!gs.deck || gs.deck.length === 0) return cb?.({ ok: false, error: "Stack is empty" });
-
-    const drawn = gs.deck[0];
-    gs.deck = gs.deck.slice(1);
-    const player = room.players[playerIdx];
-    player.hand = [...player.hand, drawn];
-    gs.phase = "throw";
-    gs.log.push(`${player.name} drew from stack`);
-
-    cb?.({ ok: true });
-    broadcastRoom(room);
-  });
-
-  // ── Throw cards ─────────────────────────────────────────────────────────────
+  // ── THROW CARDS — always the FIRST action each turn ────────────────────────
+  // Flow after throw:
+  //   same rank + same count as prevThrown → no pick needed, next player's turn
+  //   different → phase = "pick", player picks 1 card (from pickablePile or stack)
   socket.on("game:throw", ({ code, playerId, cardIds }, cb) => {
     const room = rooms[code];
     if (!room || !room.gameState) return cb?.({ ok: false, error: "No active game" });
@@ -243,52 +185,107 @@ io.on("connection", (socket) => {
     const gs = room.gameState;
     const playerIdx = room.players.findIndex(p => p.id === playerId);
     if (playerIdx !== gs.currentIdx) return cb?.({ ok: false, error: "Not your turn" });
-    if (gs.phase !== "throw") return cb?.({ ok: false, error: "Must pick a card first" });
+    if (gs.phase !== "throw") return cb?.({ ok: false, error: "You must throw cards first this turn" });
 
     const player = room.players[playerIdx];
     const throwing = player.hand.filter(c => cardIds.includes(c.id));
     if (throwing.length !== cardIds.length) return cb?.({ ok: false, error: "Invalid card selection" });
 
-    // No-pick check: if same rank + count as previous, player could have skipped pick
-    // but they already went through throw phase — that's fine, just validate the set
     const v = validateThrow(throwing);
     if (!v.valid) return cb?.({ ok: false, error: v.reason });
 
-    // Remove from hand
+    // Remove thrown cards from hand
     player.hand = player.hand.filter(c => !cardIds.includes(c.id));
+
+    const label = throwing.map(c => c.isJoker ? "JKR★" : `${c.rank}${c.suit}`).join(" ");
+
+    // The current pile (prevThrown) is what the player can pick from if needed
+    const pileBeforeThrow = gs.prevThrown;
+
+    // Check if thrown cards match the current pile (same rank + same count) → no pick
+    const noPickNeeded = matchesPrevious(throwing, pileBeforeThrow);
+
+    // New pile is now what was just thrown
     gs.prevThrown = throwing;
-    gs.phase = "pick";
+    gs.lastThrownBy = playerIdx;
 
-    const label = throwing.map(c => c.isJoker ? "JKR" : `${c.rank}${c.suit}`).join(" ");
-    gs.log.push(`${player.name} threw: ${label}`);
-
-    // Advance to next active player
-    gs.currentIdx = getNextActiveIndex(room.players, playerIdx);
+    if (noPickNeeded) {
+      // Turn ends — no pick required
+      gs.log.push(`${player.name} threw: ${label} ✓ Same set — no pick needed!`);
+      gs.currentIdx = getNextActiveIndex(room.players, playerIdx);
+      gs.phase = "throw";
+      gs.pickablePile = null;
+      gs.log.push(`${room.players[gs.currentIdx].name}'s turn!`);
+    } else {
+      // Player must now pick 1 card from the OLD pile OR draw from stack
+      gs.phase = "pick";
+      gs.pickablePile = pileBeforeThrow;  // These are what can be picked
+      gs.log.push(`${player.name} threw: ${label} — pick 1 card from the old pile or draw from stack`);
+    }
 
     cb?.({ ok: true });
     broadcastRoom(room);
   });
 
-  // ── Skip pick (same rank + count as previous throw) ─────────────────────────
-  socket.on("game:skip_pick", ({ code, playerId }, cb) => {
+  // ── PICK FROM PILE — after throwing, pick 1 card from previous pile ─────────
+  socket.on("game:pick_pile", ({ code, playerId, cardId }, cb) => {
     const room = rooms[code];
     if (!room || !room.gameState) return cb?.({ ok: false, error: "No active game" });
 
     const gs = room.gameState;
     const playerIdx = room.players.findIndex(p => p.id === playerId);
     if (playerIdx !== gs.currentIdx) return cb?.({ ok: false, error: "Not your turn" });
-    if (gs.phase !== "pick") return cb?.({ ok: false, error: "Not in pick phase" });
+    if (gs.phase !== "pick") return cb?.({ ok: false, error: "You need to throw cards first before picking" });
 
-    // The client should have already validated matchesPrevious — but we trust server to set phase
-    gs.phase = "throw";
+    const pickable = gs.pickablePile || [];
+    const card = pickable.find(c => c.id === cardId);
+    if (!card) return cb?.({ ok: false, error: "That card is not available to pick" });
+
     const player = room.players[playerIdx];
-    gs.log.push(`${player.name} skipped pick (same set as previous)`);
+    player.hand = [...player.hand, card];
+
+    const pickedLabel = card.isJoker ? "JKR★" : `${card.rank}${card.suit}`;
+    gs.log.push(`${player.name} picked ${pickedLabel} from the pile`);
+
+    // End turn — advance to next player
+    gs.currentIdx = getNextActiveIndex(room.players, playerIdx);
+    gs.phase = "throw";
+    gs.pickablePile = null;
+    gs.log.push(`${room.players[gs.currentIdx].name}'s turn!`);
 
     cb?.({ ok: true });
     broadcastRoom(room);
   });
 
-  // ── Call Show ───────────────────────────────────────────────────────────────
+  // ── DRAW FROM STACK — after throwing, draw top card from deck ──────────────
+  socket.on("game:draw_stack", ({ code, playerId }, cb) => {
+    const room = rooms[code];
+    if (!room || !room.gameState) return cb?.({ ok: false, error: "No active game" });
+
+    const gs = room.gameState;
+    const playerIdx = room.players.findIndex(p => p.id === playerId);
+    if (playerIdx !== gs.currentIdx) return cb?.({ ok: false, error: "Not your turn" });
+    if (gs.phase !== "pick") return cb?.({ ok: false, error: "You need to throw cards first before drawing" });
+    if (!gs.deck || gs.deck.length === 0) return cb?.({ ok: false, error: "The stack is empty!" });
+
+    const drawn = gs.deck[0];
+    gs.deck = gs.deck.slice(1);
+    const player = room.players[playerIdx];
+    player.hand = [...player.hand, drawn];
+
+    gs.log.push(`${player.name} drew from the stack`);
+
+    // End turn — advance to next player
+    gs.currentIdx = getNextActiveIndex(room.players, playerIdx);
+    gs.phase = "throw";
+    gs.pickablePile = null;
+    gs.log.push(`${room.players[gs.currentIdx].name}'s turn!`);
+
+    cb?.({ ok: true });
+    broadcastRoom(room);
+  });
+
+  // ── CALL SHOW — only at the start of your turn (throw phase) ──────────────
   socket.on("game:show", ({ code, playerId }, cb) => {
     const room = rooms[code];
     if (!room || !room.gameState) return cb?.({ ok: false, error: "No active game" });
@@ -296,21 +293,17 @@ io.on("connection", (socket) => {
     const gs = room.gameState;
     const playerIdx = room.players.findIndex(p => p.id === playerId);
     if (playerIdx !== gs.currentIdx) return cb?.({ ok: false, error: "Not your turn" });
+    if (gs.phase !== "throw") return cb?.({ ok: false, error: "You can only call Show at the start of your turn, before throwing" });
 
     const { players: updatedPlayers, fakeShow, callerIdx, callerSum, handSums } = resolveShow(
-      room.players,
-      playerIdx,
-      room.config
+      room.players, playerIdx, room.config
     );
     room.players = updatedPlayers;
 
     const callerName = room.players[callerIdx].name;
-    let resultMsg;
-    if (fakeShow) {
-      resultMsg = `Fake show by ${callerName}! ${callerName} pays ${room.config.showPenalty} penalty points.`;
-    } else {
-      resultMsg = `${callerName} wins the round with sum ${callerSum}! Others pay their hand sum.`;
-    }
+    const resultMsg = fakeShow
+      ? `Fake show by ${callerName}! Pays ${room.config.showPenalty} penalty pts.`
+      : `${callerName} wins with sum ${callerSum}! Others pay their hand sum.`;
 
     gs.showResult = {
       fakeShow,
@@ -327,14 +320,16 @@ io.on("connection", (socket) => {
         eliminated: p.eliminated,
         penaltyGiven: fakeShow
           ? i === callerIdx
-          : !p.eliminated && i !== callerIdx,
+          : (!p.eliminated && i !== callerIdx),
+        penaltyPoints: fakeShow
+          ? (i === callerIdx ? room.config.showPenalty : 0)
+          : (i !== callerIdx ? handSums[i] : 0),
       })),
     };
 
     gs.phase = "show_result";
     gs.log.push(resultMsg);
 
-    // Check if game over
     const activePlayers = room.players.filter(p => !p.eliminated);
     if (activePlayers.length <= 1) {
       room.status = "finished";
@@ -345,7 +340,6 @@ io.on("connection", (socket) => {
     broadcastRoom(room);
   });
 
-  // ── Next round ──────────────────────────────────────────────────────────────
   socket.on("game:next_round", ({ code, playerId }, cb) => {
     const room = rooms[code];
     if (!room || !room.gameState) return cb?.({ ok: false, error: "No active game" });
@@ -356,22 +350,29 @@ io.on("connection", (socket) => {
     room.players = players;
 
     const firstActive = room.players.findIndex(p => !p.eliminated);
+    const firstIdx = firstActive >= 0 ? firstActive : 0;
+
     room.gameState = {
-      currentIdx: firstActive >= 0 ? firstActive : 0,
-      phase: "pick",
-      prevThrown: [],
-      openingCard,
+      currentIdx: firstIdx,
+      phase: "throw",
+      prevThrown: [openingCard],
+      pickablePile: null,
       deck,
-      log: [...room.gameState.log, `--- Round ${room.gameState.roundNum + 1} ---`, `${room.players[firstActive >= 0 ? firstActive : 0].name} goes first.`],
+      log: [
+        ...room.gameState.log,
+        `─── Round ${room.gameState.roundNum + 1} ───`,
+        `Opening card: ${openingCard.rank}${openingCard.suit} on the table.`,
+        `${room.players[firstIdx].name} goes first!`,
+      ],
       showResult: null,
       roundNum: room.gameState.roundNum + 1,
+      lastThrownBy: null,
     };
 
     cb?.({ ok: true });
     broadcastRoom(room);
   });
 
-  // ── Disconnect ──────────────────────────────────────────────────────────────
   socket.on("disconnect", () => {
     const room = findRoomBySocket(socket.id);
     if (!room) return;
@@ -384,7 +385,6 @@ io.on("connection", (socket) => {
   });
 });
 
-// ─── Health check ─────────────────────────────────────────────────────────────
 app.get("/health", (req, res) => res.json({ ok: true, rooms: Object.keys(rooms).length }));
 
 const PORT = process.env.PORT || 3001;
