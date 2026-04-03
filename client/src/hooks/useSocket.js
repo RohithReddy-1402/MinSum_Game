@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { io } from "socket.io-client";
 
-const SERVER_URL = import.meta.env.VITE_SERVER_URL || "";
+const SERVER_URL = import.meta.env.VITE_SERVER_URL || "https://minsum-game.onrender.com";
 
 let _socket = null;
 
